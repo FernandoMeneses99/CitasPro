@@ -1,10 +1,11 @@
 import type { Metadata, Viewport } from "next";
+
+import { getAppUrl } from "@/lib/app-url";
+
 import "./globals.css";
 
 export const metadata: Metadata = {
-  metadataBase: new URL(
-    process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
-  ),
+  metadataBase: new URL(getAppUrl()),
   title: {
     default: "Citas Pro — Agenda inteligente para profesionales",
     template: "%s · Citas Pro",

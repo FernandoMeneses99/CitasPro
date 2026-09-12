@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { getAppUrl } from "@/lib/app-url";
 import { createClient } from "@/lib/supabase/server";
 import { slugify } from "@/lib/utils";
 
@@ -50,7 +51,7 @@ export async function registerAction(
     password,
     options: {
       data: { full_name: fullName },
-      emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/login`,
+      emailRedirectTo: `${getAppUrl()}/login`,
     },
   });
 
