@@ -23,49 +23,55 @@ $$;
 -- -------------------------------------------------------------
 create or replace function public.is_zentro_admin()
 returns boolean
-language sql
+language plpgsql
 security definer
 set search_path = public
 stable
 as $$
-  select exists (
+begin
+  return exists (
     select 1 from public.profiles p
     where p.id = auth.uid()
       and p.role = 'zentro_admin'
       and p.is_active
   );
+end;
 $$;
 
 create or replace function public.is_tenant_member(p_tenant uuid)
 returns boolean
-language sql
+language plpgsql
 security definer
 set search_path = public
 stable
 as $$
-  select exists (
+begin
+  return exists (
     select 1 from public.profiles p
     where p.id = auth.uid()
       and p.tenant_id = p_tenant
       and p.role in ('owner', 'staff')
       and p.is_active
   );
+end;
 $$;
 
 create or replace function public.is_tenant_owner(p_tenant uuid)
 returns boolean
-language sql
+language plpgsql
 security definer
 set search_path = public
 stable
 as $$
-  select exists (
+begin
+  return exists (
     select 1 from public.profiles p
     where p.id = auth.uid()
       and p.tenant_id = p_tenant
       and p.role = 'owner'
       and p.is_active
   );
+end;
 $$;
 
 -- -------------------------------------------------------------
@@ -99,6 +105,7 @@ create table if not exists public.tenants (
   updated_at         timestamptz not null default now()
 );
 
+drop trigger if exists tenants_updated_at on public.tenants;
 create trigger tenants_updated_at
 before update on public.tenants
 for each row execute function public.set_updated_at();
@@ -120,6 +127,7 @@ create table if not exists public.profiles (
   updated_at  timestamptz not null default now()
 );
 
+drop trigger if exists profiles_updated_at on public.profiles;
 create trigger profiles_updated_at
 before update on public.profiles
 for each row execute function public.set_updated_at();
@@ -139,6 +147,7 @@ begin
 end;
 $$;
 
+drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
 after insert on auth.users
 for each row execute function public.handle_new_user();
@@ -159,7 +168,7 @@ create table if not exists public.services (
   updated_at       timestamptz not null default now()
 );
 
-create index services_tenant_idx on public.services (tenant_id);
+create index if not exists services_tenant_idx on public.services (tenant_id);
 
 -- asignación servicio ↔ colaborador
 create table if not exists public.service_staff (
@@ -183,7 +192,7 @@ create table if not exists public.customers (
   unique (tenant_id, email)
 );
 
-create index customers_tenant_idx on public.customers (tenant_id);
+create index if not exists customers_tenant_idx on public.customers (tenant_id);
 
 -- -------------------------------------------------------------
 -- appointments (núcleo de citas)
@@ -206,8 +215,8 @@ create table if not exists public.appointments (
   check (ends_at > starts_at)
 );
 
-create index appointments_tenant_starts_idx on public.appointments (tenant_id, starts_at);
-create index appointments_tenant_status_idx on public.appointments (tenant_id, status);
+create index if not exists appointments_tenant_starts_idx on public.appointments (tenant_id, starts_at);
+create index if not exists appointments_tenant_status_idx on public.appointments (tenant_id, status);
 
 -- Evita solapamientos de citas confirmadas/pendientes (misma agenda)
 create or replace function public.prevent_appointment_overlap()
@@ -233,6 +242,7 @@ begin
 end;
 $$;
 
+drop trigger if exists appointments_no_overlap on public.appointments;
 create trigger appointments_no_overlap
 before insert or update of starts_at, ends_at, staff_id, status, tenant_id
 on public.appointments
@@ -254,7 +264,7 @@ create table if not exists public.availability (
   created_at  timestamptz not null default now()
 );
 
-create index availability_tenant_idx on public.availability (tenant_id, day_of_week);
+create index if not exists availability_tenant_idx on public.availability (tenant_id, day_of_week);
 
 -- -------------------------------------------------------------
 -- blocks (bloqueos puntuales)
@@ -269,7 +279,7 @@ create table if not exists public.blocks (
   created_at timestamptz not null default now()
 );
 
-create index blocks_tenant_idx on public.blocks (tenant_id, starts_at);
+create index if not exists blocks_tenant_idx on public.blocks (tenant_id, starts_at);
 
 -- -------------------------------------------------------------
 -- promotions
@@ -292,7 +302,7 @@ create table if not exists public.promotions (
   unique (tenant_id, code)
 );
 
-create index promotions_tenant_idx on public.promotions (tenant_id);
+create index if not exists promotions_tenant_idx on public.promotions (tenant_id);
 
 -- -------------------------------------------------------------
 -- invitations (códigos de invitado / referidos / staff)
@@ -344,7 +354,7 @@ create table if not exists public.notifications (
   created_at timestamptz not null default now()
 );
 
-create index notifications_user_idx on public.notifications (user_id, created_at);
+create index if not exists notifications_user_idx on public.notifications (user_id, created_at);
 
 -- =============================================================
 -- Vistas públicas (landing SEO-safe, solo datos de negocio activos)
@@ -491,6 +501,7 @@ declare
   v_interval  interval;
   r           record;
   v_slot      time;
+  v_start     timestamptz;
 begin
   select t.id into v_tenant_id
   from public.tenants t
@@ -531,22 +542,23 @@ begin
     v_slot := r.start_time;
     while (v_slot + v_interval) <= r.end_time loop
 
-      starts_at := timezone('UTC', p_date + v_slot);
-      if starts_at > now() then
+      v_start := timezone('UTC', p_date + v_slot);
+      if v_start > now() then
 
         if not exists (
           select 1 from public.appointments ap
           where ap.tenant_id = v_tenant_id
             and ap.status in ('pending','confirmed')
-            and ap.starts_at < starts_at + v_interval
-            and ap.ends_at > starts_at
+            and ap.starts_at < v_start + v_interval
+            and ap.ends_at > v_start
             and (ap.staff_id is null or r.staff_id is null or ap.staff_id = r.staff_id)
         ) and not exists (
           select 1 from public.blocks b
           where b.tenant_id = v_tenant_id
-            and b.starts_at < starts_at + v_interval
-            and b.ends_at > starts_at
+            and b.starts_at < v_start + v_interval
+            and b.ends_at > v_start
         ) then
+          starts_at := v_start;
           staff_id := r.staff_id;
           if r.staff_id is not null then
             select coalesce(full_name, '') into staff_name
@@ -700,24 +712,33 @@ alter table public.tenant_settings enable row level security;
 alter table public.notifications enable row level security;
 
 -- tenants -----------------------------------------------------------------
+drop policy if exists tenants_select_members on public.tenants;
 create policy tenants_select_members on public.tenants
   for select to authenticated
   using (is_zentro_admin() or is_tenant_member(id));
 
+drop policy if exists tenants_insert_admin on public.tenants;
 create policy tenants_insert_admin on public.tenants
   for insert to authenticated
   with check (is_zentro_admin());
 
-create policy tenants_update_members on public.tenants
+drop policy if exists tenants_update_members_update on public.tenants;
+drop policy if exists tenants_update_members_update on public.tenants;
+create policy tenants_update_members_update on public.tenants
   for update to authenticated
   using (is_zentro_admin() or is_tenant_owner(id))
-  with check (is_zentro_admin() or is_tenant_owner(id));
+  with check (is_zentro_admin() or is_tenant_owner(id))
+;
 
+
+
+drop policy if exists tenants_delete_admin on public.tenants;
 create policy tenants_delete_admin on public.tenants
   for delete to authenticated
   using (is_zentro_admin());
 
 -- profiles ------------------------------------------------------------------
+drop policy if exists profiles_select_self on public.profiles;
 create policy profiles_select_self on public.profiles
   for select to authenticated
   using (
@@ -726,51 +747,117 @@ create policy profiles_select_self on public.profiles
     or (tenant_id is not null and is_tenant_member(tenant_id))
   );
 
+drop policy if exists profiles_insert_owner on public.profiles;
 create policy profiles_insert_owner on public.profiles
   for insert to authenticated
   with check (is_zentro_admin() or (tenant_id is not null and is_tenant_member(tenant_id)));
 
-create policy profiles_update_self on public.profiles
+drop policy if exists profiles_update_self_update on public.profiles;
+drop policy if exists profiles_update_self_update on public.profiles;
+create policy profiles_update_self_update on public.profiles
   for update to authenticated
   using (id = auth.uid() or is_zentro_admin() or (tenant_id is not null and is_tenant_member(tenant_id)))
-  with check (id = auth.uid() or is_zentro_admin() or (tenant_id is not null and is_tenant_member(tenant_id)));
+  with check (id = auth.uid() or is_zentro_admin() or (tenant_id is not null and is_tenant_member(tenant_id)))
+;
 
+
+
+drop policy if exists profiles_delete_members on public.profiles;
 create policy profiles_delete_members on public.profiles
   for delete to authenticated
   using (is_zentro_admin() or (tenant_id is not null and is_tenant_owner(tenant_id)));
 
 -- services -------------------------------------------------------------------
+drop policy if exists services_select_public on public.services;
 create policy services_select_public on public.services
-  for select to anon, authenticated
-  using (true);
+  for select to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id));
 
-create policy services_write_members on public.services
-  for insert, update, delete to authenticated
+drop policy if exists services_write_members_insert on public.services;
+drop policy if exists services_write_members_insert on public.services;
+create policy services_write_members_insert on public.services
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists services_write_members_update on public.services;
+drop policy if exists services_write_members_update on public.services;
+create policy services_write_members_update on public.services
+  for update to authenticated
   using (is_zentro_admin() or is_tenant_member(tenant_id))
-  with check (is_zentro_admin() or is_tenant_member(tenant_id));
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists services_write_members_delete on public.services;
+drop policy if exists services_write_members_delete on public.services;
+create policy services_write_members_delete on public.services
+  for delete to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+
 
 -- service_staff ----------------------------------------------------------------
+drop policy if exists service_staff_select_members on public.service_staff;
 create policy service_staff_select_members on public.service_staff
   for select to authenticated
   using (is_zentro_admin() or is_tenant_member(
     (select s.tenant_id from public.services s where s.id = service_id)
   ));
 
-create policy service_staff_write_members on public.service_staff
-  for insert, update, delete to authenticated
+drop policy if exists service_staff_write_members_insert on public.service_staff;
+create policy service_staff_write_members_insert on public.service_staff
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_member(
+    (select s.tenant_id from public.services s where s.id = service_id)
+  ));
+
+drop policy if exists service_staff_write_members_update on public.service_staff;
+create policy service_staff_write_members_update on public.service_staff
+  for update to authenticated
+  using (is_zentro_admin() or is_tenant_member(
+    (select s.tenant_id from public.services s where s.id = service_id)
+  ))
+  with check (is_zentro_admin() or is_tenant_member(
+    (select s.tenant_id from public.services s where s.id = service_id)
+  ));
+
+drop policy if exists service_staff_write_members_delete on public.service_staff;
+create policy service_staff_write_members_delete on public.service_staff
+  for delete to authenticated
   using (is_zentro_admin() or is_tenant_member(
     (select s.tenant_id from public.services s where s.id = service_id)
   ));
 
 -- customers ---------------------------------------------------------------------
+drop policy if exists customers_select_members on public.customers;
 create policy customers_select_members on public.customers
   for select to authenticated
   using (is_zentro_admin() or is_tenant_member(tenant_id));
 
-create policy customers_write_members on public.customers
-  for insert, update, delete to authenticated
+drop policy if exists customers_write_members_insert on public.customers;
+drop policy if exists customers_write_members_insert on public.customers;
+create policy customers_write_members_insert on public.customers
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists customers_write_members_update on public.customers;
+drop policy if exists customers_write_members_update on public.customers;
+create policy customers_write_members_update on public.customers
+  for update to authenticated
   using (is_zentro_admin() or is_tenant_member(tenant_id))
-  with check (is_zentro_admin() or is_tenant_member(tenant_id));
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists customers_write_members_delete on public.customers;
+drop policy if exists customers_write_members_delete on public.customers;
+create policy customers_write_members_delete on public.customers
+  for delete to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+
 
 -- appointments --------------------------------------------------------------------
 create or replace function public.can_read_appointment(p_id uuid, p_tenant uuid)
@@ -790,6 +877,7 @@ as $$
   );
 $$;
 
+drop policy if exists appointments_select on public.appointments;
 create policy appointments_select on public.appointments
   for select to authenticated
   using (
@@ -798,78 +886,195 @@ create policy appointments_select on public.appointments
     or can_read_appointment(id, tenant_id)
   );
 
-create policy appointments_write_members on public.appointments
-  for insert, update to authenticated
-  using (is_zentro_admin() or is_tenant_member(tenant_id))
-  with check (is_zentro_admin() or is_tenant_member(tenant_id));
+drop policy if exists appointments_write_members_insert on public.appointments;
+drop policy if exists appointments_write_members_insert on public.appointments;
+create policy appointments_write_members_insert on public.appointments
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
 
+drop policy if exists appointments_write_members_update on public.appointments;
+drop policy if exists appointments_write_members_update on public.appointments;
+create policy appointments_write_members_update on public.appointments
+  for update to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id))
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+
+
+drop policy if exists appointments_delete_admin on public.appointments;
 create policy appointments_delete_admin on public.appointments
   for delete to authenticated
   using (is_zentro_admin());
 
 -- availability --------------------------------------------------------------------
+drop policy if exists availability_select_public on public.availability;
 create policy availability_select_public on public.availability
-  for select to anon, authenticated
-  using (true);
+  for select to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id));
 
-create policy availability_write_members on public.availability
-  for insert, update, delete to authenticated
+drop policy if exists availability_write_members_insert on public.availability;
+drop policy if exists availability_write_members_insert on public.availability;
+create policy availability_write_members_insert on public.availability
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists availability_write_members_update on public.availability;
+drop policy if exists availability_write_members_update on public.availability;
+create policy availability_write_members_update on public.availability
+  for update to authenticated
   using (is_zentro_admin() or is_tenant_member(tenant_id))
-  with check (is_zentro_admin() or is_tenant_member(tenant_id));
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists availability_write_members_delete on public.availability;
+drop policy if exists availability_write_members_delete on public.availability;
+create policy availability_write_members_delete on public.availability
+  for delete to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+
 
 -- blocks ---------------------------------------------------------------------------
+drop policy if exists blocks_select_members on public.blocks;
 create policy blocks_select_members on public.blocks
   for select to authenticated
   using (is_zentro_admin() or is_tenant_member(tenant_id));
 
-create policy blocks_write_members on public.blocks
-  for insert, update, delete to authenticated
+drop policy if exists blocks_write_members_insert on public.blocks;
+drop policy if exists blocks_write_members_insert on public.blocks;
+create policy blocks_write_members_insert on public.blocks
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists blocks_write_members_update on public.blocks;
+drop policy if exists blocks_write_members_update on public.blocks;
+create policy blocks_write_members_update on public.blocks
+  for update to authenticated
   using (is_zentro_admin() or is_tenant_member(tenant_id))
-  with check (is_zentro_admin() or is_tenant_member(tenant_id));
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists blocks_write_members_delete on public.blocks;
+drop policy if exists blocks_write_members_delete on public.blocks;
+create policy blocks_write_members_delete on public.blocks
+  for delete to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+
 
 -- promotions ------------------------------------------------------------------------
+drop policy if exists promotions_select_public on public.promotions;
 create policy promotions_select_public on public.promotions
-  for select to anon, authenticated
-  using (true);
+  for select to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id));
 
-create policy promotions_write_members on public.promotions
-  for insert, update, delete to authenticated
+drop policy if exists promotions_write_members_insert on public.promotions;
+drop policy if exists promotions_write_members_insert on public.promotions;
+create policy promotions_write_members_insert on public.promotions
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists promotions_write_members_update on public.promotions;
+drop policy if exists promotions_write_members_update on public.promotions;
+create policy promotions_write_members_update on public.promotions
+  for update to authenticated
   using (is_zentro_admin() or is_tenant_member(tenant_id))
-  with check (is_zentro_admin() or is_tenant_member(tenant_id));
+  with check (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+drop policy if exists promotions_write_members_delete on public.promotions;
+drop policy if exists promotions_write_members_delete on public.promotions;
+create policy promotions_write_members_delete on public.promotions
+  for delete to authenticated
+  using (is_zentro_admin() or is_tenant_member(tenant_id))
+;
+
+
 
 -- invitations -------------------------------------------------------------------------
+drop policy if exists invitations_select_members on public.invitations;
 create policy invitations_select_members on public.invitations
   for select to authenticated
   using (is_zentro_admin() or (tenant_id is not null and is_tenant_member(tenant_id)));
 
-create policy invitations_write_owner on public.invitations
-  for insert, update, delete to authenticated
+drop policy if exists invitations_write_owner_insert on public.invitations;
+drop policy if exists invitations_write_owner_insert on public.invitations;
+create policy invitations_write_owner_insert on public.invitations
+  for insert to authenticated
+  with check (is_zentro_admin() or (tenant_id is not null and is_tenant_owner(tenant_id)))
+;
+
+drop policy if exists invitations_write_owner_update on public.invitations;
+drop policy if exists invitations_write_owner_update on public.invitations;
+create policy invitations_write_owner_update on public.invitations
+  for update to authenticated
   using (is_zentro_admin() or (tenant_id is not null and is_tenant_owner(tenant_id)))
-  with check (is_zentro_admin() or (tenant_id is not null and is_tenant_owner(tenant_id)));
+  with check (is_zentro_admin() or (tenant_id is not null and is_tenant_owner(tenant_id)))
+;
+
+drop policy if exists invitations_write_owner_delete on public.invitations;
+drop policy if exists invitations_write_owner_delete on public.invitations;
+create policy invitations_write_owner_delete on public.invitations
+  for delete to authenticated
+  using (is_zentro_admin() or (tenant_id is not null and is_tenant_owner(tenant_id)))
+;
+
+
 
 -- tenant_settings ----------------------------------------------------------------------
+drop policy if exists tenant_settings_select_owner on public.tenant_settings;
 create policy tenant_settings_select_owner on public.tenant_settings
   for select to authenticated
   using (is_zentro_admin() or is_tenant_owner(tenant_id));
 
-create policy tenant_settings_write_owner on public.tenant_settings
-  for insert, update, delete to authenticated
+drop policy if exists tenant_settings_write_owner_insert on public.tenant_settings;
+drop policy if exists tenant_settings_write_owner_insert on public.tenant_settings;
+create policy tenant_settings_write_owner_insert on public.tenant_settings
+  for insert to authenticated
+  with check (is_zentro_admin() or is_tenant_owner(tenant_id))
+;
+
+drop policy if exists tenant_settings_write_owner_update on public.tenant_settings;
+drop policy if exists tenant_settings_write_owner_update on public.tenant_settings;
+create policy tenant_settings_write_owner_update on public.tenant_settings
+  for update to authenticated
   using (is_zentro_admin() or is_tenant_owner(tenant_id))
-  with check (is_zentro_admin() or is_tenant_owner(tenant_id));
+  with check (is_zentro_admin() or is_tenant_owner(tenant_id))
+;
+
+drop policy if exists tenant_settings_write_owner_delete on public.tenant_settings;
+drop policy if exists tenant_settings_write_owner_delete on public.tenant_settings;
+create policy tenant_settings_write_owner_delete on public.tenant_settings
+  for delete to authenticated
+  using (is_zentro_admin() or is_tenant_owner(tenant_id))
+;
+
+
 
 -- notifications --------------------------------------------------------------------------
+drop policy if exists notifications_select_receiver on public.notifications;
 create policy notifications_select_receiver on public.notifications
   for select to authenticated
   using (is_zentro_admin() or (user_id is not null and user_id = auth.uid()));
 
+drop policy if exists notifications_insert_members on public.notifications;
 create policy notifications_insert_members on public.notifications
   for insert to authenticated
   with check (is_zentro_admin() or (tenant_id is not null and is_tenant_member(tenant_id)));
 
+drop policy if exists notifications_update_receiver on public.notifications;
 create policy notifications_update_receiver on public.notifications
   for update to authenticated
   using (user_id = auth.uid() or is_zentro_admin());
 
+drop policy if exists notifications_delete_owner on public.notifications;
 create policy notifications_delete_owner on public.notifications
   for delete to authenticated
   using (is_zentro_admin() or is_tenant_owner(tenant_id));
